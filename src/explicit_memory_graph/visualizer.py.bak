@@ -1,0 +1,662 @@
+"""
+3D Scene Graph Visualization (HOV-SG style - exact replica)
+
+Uses PyVista (VTK-based) for interactive 3D visualization, matching HOV-SG's style:
+  - Floor nodes: orange spheres (radius=0.5)
+  - Room nodes: blue spheres (radius=0.25)
+  - Object nodes: colored point clouds (random colors)
+  - Edges: lines connecting floor→room→object
+"""
+
+import os
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+
+import numpy as np
+
+try:
+    import pyvista as pv
+except Exception:
+    pv = None
+
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
+
+
+class SceneGraphVisualizer:
+    """Generate 3D scene graph visualizations exactly like HOV-SG (using PyVista)."""
+
+    def __init__(self, voxel_size: float = 0.1):
+        self.voxel_size = voxel_size
+
+    def visualize_hierarchical_graph(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        floor_id: str,
+        output_path: str,
+    ):
+        """Generate a 3D hierarchical scene graph visualization (HOV-SG replica).
+
+        Args:
+            regions: region_id -> RegionNode
+            scene_objects: obj_id -> object dict
+            obj_to_region: obj_id -> region_id mapping
+            floor_id: floor identifier
+            output_path: where to save the visualization (screenshot)
+        """
+        if pv is None or o3d is None:
+            import logging
+            logging.warning("PyVista or Open3D not available, skipping 3D visualization")
+            return
+
+        if not scene_objects:
+            return
+
+        # Initialize PyVista plotter
+        p = pv.Plotter(off_screen=True)  # off_screen for saving screenshots
+
+        # Build hierarchy topology
+        hier_topo = defaultdict(dict)
+        hier_topo[floor_id] = {}
+        for rid in regions.keys():
+            hier_topo[floor_id][f"{floor_id}_{rid}"] = []
+
+        for obj_id, obj in scene_objects.items():
+            rid = obj_to_region.get(obj_id)
+            if rid is not None:
+                room_id_str = f"{floor_id}_{rid}"
+                hier_topo[floor_id][room_id_str].append(str(obj_id))
+
+        # Compute centroids
+        floor_centroid = self._compute_floor_centroid(regions)
+        room_centroids = self._compute_room_centroids(regions)
+        obj_centroids = self._compute_object_centroids(scene_objects)
+
+        # Visualization offsets (HOV-SG style: floors stacked vertically)
+        viz_offset = np.array([0.0, 0.0, 0.0])  # single floor for now
+        floor_centroid_viz = floor_centroid + viz_offset + np.array([0.0, 4.0, 0.0])
+
+        # 1) Visualize floor node (orange sphere, radius=0.5)
+        p.add_mesh(pv.Sphere(center=tuple(floor_centroid_viz), radius=0.5), color="orange")
+
+        # 2) Visualize room nodes (blue spheres, radius=0.25) + floor→room edges
+        room_centroids_viz = {}
+        for room_id_str, room_centroid in room_centroids.items():
+            room_centroid_viz = room_centroid + viz_offset + np.array([0.0, 3.5, 0.0])
+            room_centroids_viz[room_id_str] = room_centroid_viz
+            p.add_mesh(pv.Sphere(center=tuple(room_centroid_viz), radius=0.25), color="blue")
+            # floor→room edge
+            p.add_mesh(
+                pv.Line(tuple(floor_centroid_viz), tuple(room_centroid_viz)),
+                line_width=4,
+                color="white",
+            )
+
+        # 3) Visualize object nodes (point clouds + room→object edges)
+        for obj_id, obj in scene_objects.items():
+            rid = obj_to_region.get(obj_id)
+            if rid is None:
+                continue
+            room_id_str = f"{floor_id}_{rid}"
+            if room_id_str not in room_centroids_viz:
+                continue
+
+            obj_name = obj.get("class_name", "unknown")
+            # filter out wall/floor/ceiling (like HOV-SG does)
+            if any(
+                substring in obj_name.lower()
+                for substring in ["wall", "floor", "ceiling", "paneling", "banner", "overhang"]
+            ):
+                continue
+
+            pcd = obj.get("pcd")
+            if pcd is None or not hasattr(pcd, "points") or len(pcd.points) < 100:
+                continue
+
+            # apply offset
+            cloud_xyz = np.asarray(pcd.points) + viz_offset
+            obj_centroid_viz = obj_centroids.get(str(obj_id), cloud_xyz.mean(axis=0))
+
+            # room→object edge
+            p.add_mesh(
+                pv.Line(tuple(room_centroids_viz[room_id_str]), tuple(obj_centroid_viz)),
+                line_width=1.5,
+                opacity=0.5,
+                color="gray",
+            )
+
+            # object point cloud (random color like HOV-SG)
+            random_color = np.random.rand(3)
+            cloud = pv.PolyData(cloud_xyz)
+            colors_array = np.tile(random_color, (cloud_xyz.shape[0], 1))
+            p.add_mesh(
+                cloud,
+                scalars=colors_array,
+                rgb=True,
+                point_size=5,
+                show_vertices=True,
+            )
+
+        # Set camera and save screenshot
+        p.camera_position = "iso"
+        p.screenshot(output_path, transparent_background=False)
+        p.close()
+
+    def _compute_floor_centroid(self, regions: Dict[int, Any]) -> np.ndarray:
+        """Compute floor centroid from all region masks."""
+        all_coords = []
+        for rn in regions.values():
+            if rn.mask is not None:
+                coords = np.argwhere(rn.mask)
+                if len(coords) > 0:
+                    # convert grid coords to world (rough)
+                    coords_world = coords * self.voxel_size
+                    all_coords.append(coords_world)
+        if not all_coords:
+            return np.array([0.0, 0.0, 0.0])
+        all_coords = np.vstack(all_coords)
+        return all_coords.mean(axis=0)
+
+    def _compute_room_centroids(self, regions: Dict[int, Any]) -> Dict[str, np.ndarray]:
+        """Compute room centroids from region masks."""
+        centroids = {}
+        for rid, rn in regions.items():
+            if rn.mask is not None:
+                coords = np.argwhere(rn.mask)
+                if len(coords) > 0:
+                    coords_world = coords * self.voxel_size
+                    centroids[f"{rn.floor_id}_{rid}"] = coords_world.mean(axis=0)
+        return centroids
+
+    def _compute_object_centroids(self, scene_objects: Dict[int, Dict[str, Any]]) -> Dict[str, np.ndarray]:
+        """Compute object centroids from point clouds."""
+        centroids = {}
+        for obj_id, obj in scene_objects.items():
+            pcd = obj.get("pcd")
+            if pcd is not None and hasattr(pcd, "points") and len(pcd.points) > 0:
+                centroids[str(obj_id)] = np.asarray(pcd.points).mean(axis=0)
+            else:
+                bbox = obj.get("bbox")
+                if bbox is not None and hasattr(bbox, "center"):
+                    centroids[str(obj_id)] = np.asarray(bbox.center)
+        return centroids
+
+    def generate_graph_visualization_video(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        floor_id: str,
+        output_video_path: str,
+        n_frames: int = 60,
+        fps: int = 10,
+    ):
+        """Generate a rotating 3D scene graph video (HOV-SG style).
+
+        Args:
+            n_frames: number of rotation frames
+            fps: frames per second
+        """
+        if pv is None or o3d is None:
+            return
+
+        if not scene_objects:
+            return
+
+        # Build the scene (same as visualize_hierarchical_graph)
+        p = pv.Plotter(off_screen=True)
+
+        hier_topo = defaultdict(dict)
+        hier_topo[floor_id] = {}
+        for rid in regions.keys():
+            hier_topo[floor_id][f"{floor_id}_{rid}"] = []
+        for obj_id, obj in scene_objects.items():
+            rid = obj_to_region.get(obj_id)
+            if rid is not None:
+                room_id_str = f"{floor_id}_{rid}"
+                hier_topo[floor_id][room_id_str].append(str(obj_id))
+
+        floor_centroid = self._compute_floor_centroid(regions)
+        room_centroids = self._compute_room_centroids(regions)
+        obj_centroids = self._compute_object_centroids(scene_objects)
+
+        viz_offset = np.array([0.0, 0.0, 0.0])
+        floor_centroid_viz = floor_centroid + viz_offset + np.array([0.0, 4.0, 0.0])
+
+        # Add meshes
+        p.add_mesh(pv.Sphere(center=tuple(floor_centroid_viz), radius=0.5), color="orange")
+
+        room_centroids_viz = {}
+        for room_id_str, room_centroid in room_centroids.items():
+            room_centroid_viz = room_centroid + viz_offset + np.array([0.0, 3.5, 0.0])
+            room_centroids_viz[room_id_str] = room_centroid_viz
+            p.add_mesh(pv.Sphere(center=tuple(room_centroid_viz), radius=0.25), color="blue")
+            p.add_mesh(pv.Line(tuple(floor_centroid_viz), tuple(room_centroid_viz)), line_width=4, color="white")
+
+        for obj_id, obj in scene_objects.items():
+            rid = obj_to_region.get(obj_id)
+            if rid is None:
+                continue
+            room_id_str = f"{floor_id}_{rid}"
+            if room_id_str not in room_centroids_viz:
+                continue
+            obj_name = obj.get("class_name", "unknown")
+            if any(substring in obj_name.lower() for substring in ["wall", "floor", "ceiling", "paneling", "banner", "overhang"]):
+                continue
+            pcd = obj.get("pcd")
+            if pcd is None or not hasattr(pcd, "points") or len(pcd.points) < 100:
+                continue
+            cloud_xyz = np.asarray(pcd.points) + viz_offset
+            obj_centroid_viz = obj_centroids.get(str(obj_id), cloud_xyz.mean(axis=0))
+            p.add_mesh(pv.Line(tuple(room_centroids_viz[room_id_str]), tuple(obj_centroid_viz)), line_width=1.5, opacity=0.5, color="gray")
+            random_color = np.random.rand(3)
+            cloud = pv.PolyData(cloud_xyz)
+            colors_array = np.tile(random_color, (cloud_xyz.shape[0], 1))
+            p.add_mesh(cloud, scalars=colors_array, rgb=True, point_size=5, show_vertices=True)
+
+        # Generate rotating frames
+        frames = []
+        for frame_idx in range(n_frames):
+            azimuth = frame_idx * 360 / n_frames
+            p.camera_position = "iso"
+            p.camera.azimuth = azimuth
+            p.camera.elevation = 20
+            
+            # render frame
+            img = p.screenshot(return_img=True, transparent_background=False)
+            frames.append(img)
+
+        p.close()
+
+        # save video/gif
+        try:
+            import imageio
+            if output_video_path.endswith(".gif"):
+                imageio.mimsave(output_video_path, frames, fps=fps, loop=0)
+            else:
+                imageio.mimsave(output_video_path, frames, fps=fps, codec="libx264")
+        except Exception as e:
+            # fallback: save frames
+            frame_dir = output_video_path.replace(".mp4", "_frames").replace(".gif", "_frames")
+            os.makedirs(frame_dir, exist_ok=True)
+            try:
+                import matplotlib.pyplot as plt
+                for i, frame in enumerate(frames):
+                    plt.imsave(os.path.join(frame_dir, f"{i:04d}.png"), frame)
+            except Exception:
+                pass
+
+    """Generate 3D scene graph visualizations similar to HOV-SG."""
+
+    def __init__(self, voxel_size: float = 0.1):
+        self.voxel_size = voxel_size
+
+    def visualize_hierarchical_graph(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        floor_id: str,
+        output_path: str,
+    ):
+        """Generate a 3D hierarchical scene graph visualization.
+
+        Args:
+            regions: region_id -> RegionNode
+            scene_objects: obj_id -> object dict
+            obj_to_region: obj_id -> region_id mapping
+            floor_id: floor identifier
+            output_path: where to save the visualization
+        """
+        if not scene_objects:
+            return
+
+        # Build graph structure
+        G = self._build_scene_graph(regions, scene_objects, obj_to_region, floor_id)
+
+        # Compute 3D positions for nodes
+        node_positions = self._compute_3d_layout(G, regions, scene_objects, obj_to_region)
+
+        # Render with matplotlib 3D
+        self._render_matplotlib_3d(G, node_positions, output_path)
+
+        # Also try open3d if available
+        if o3d is not None:
+            self._render_open3d_scene(
+                regions, scene_objects, obj_to_region, 
+                output_path.replace(".png", "_open3d.ply")
+            )
+
+    def _build_scene_graph(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        floor_id: str,
+    ):
+        """Build a networkx graph representing the scene hierarchy."""
+        if nx is None:
+            # fallback if networkx not available
+            class DummyGraph:
+                def __init__(self):
+                    self.nodes = {}
+                    self.edges = []
+                def add_node(self, n, **kwargs):
+                    self.nodes[n] = kwargs
+                def add_edge(self, a, b, **kwargs):
+                    self.edges.append((a, b, kwargs))
+            return DummyGraph()
+
+        G = nx.DiGraph()
+
+        # Building node (root)
+        G.add_node("building", level=0, type="building", color="red")
+
+        # Floor node
+        floor_node = f"floor_{floor_id}"
+        G.add_node(floor_node, level=1, type="floor", color="orange")
+        G.add_edge("building", floor_node)
+
+        # Region (room) nodes
+        for rid, rn in regions.items():
+            room_node = f"room_{floor_id}_{rid}"
+            G.add_node(room_node, level=2, type="room", color="blue", region_id=rid)
+            G.add_edge(floor_node, room_node)
+
+        # Object nodes
+        for obj_id, obj in scene_objects.items():
+            rid = obj_to_region.get(obj_id)
+            if rid is None:
+                continue  # object not assigned to any region
+            room_node = f"room_{floor_id}_{rid}"
+            obj_node = f"obj_{obj_id}"
+            class_name = obj.get("class_name", "?")
+            G.add_node(
+                obj_node,
+                level=3,
+                type="object",
+                color="green",
+                obj_id=obj_id,
+                class_name=class_name,
+            )
+            G.add_edge(room_node, obj_node)
+
+        return G
+
+    def _compute_3d_layout(
+        self,
+        G,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+    ) -> Dict[str, np.ndarray]:
+        """Compute 3D positions for each graph node.
+
+        Strategy:
+          - level 0 (building): center top
+          - level 1 (floor): below building
+          - level 2 (rooms): arranged in a ring around floor, offset by region centroid
+          - level 3 (objects): at actual 3D bbox center
+        """
+        pos = {}
+
+        # Building node at top center
+        pos["building"] = np.array([0.0, 0.0, 3.0])
+
+        # Floor node below
+        floor_nodes = [n for n, d in G.nodes.items() if d.get("type") == "floor"]
+        if floor_nodes:
+            pos[floor_nodes[0]] = np.array([0.0, 0.0, 2.0])
+
+        # Room nodes: arrange in XY plane at z=1, offset by region spatial info
+        room_nodes = [n for n, d in G.nodes.items() if d.get("type") == "room"]
+        if room_nodes:
+            angle_step = 2 * np.pi / max(len(room_nodes), 1)
+            for idx, rnode in enumerate(room_nodes):
+                rid = G.nodes[rnode].get("region_id")
+                # try to get region centroid from mask
+                centroid_xy = self._region_centroid_xy(regions.get(rid))
+                # or use circular layout
+                angle = idx * angle_step
+                x = 2.0 * np.cos(angle) + centroid_xy[0] * self.voxel_size * 0.01
+                y = 2.0 * np.sin(angle) + centroid_xy[1] * self.voxel_size * 0.01
+                pos[rnode] = np.array([x, y, 1.0])
+
+        # Object nodes: use actual bbox center
+        obj_nodes = [n for n, d in G.nodes.items() if d.get("type") == "object"]
+        for onode in obj_nodes:
+            obj_id = G.nodes[onode].get("obj_id")
+            obj = scene_objects.get(obj_id)
+            if obj is None:
+                pos[onode] = np.array([0.0, 0.0, 0.0])
+                continue
+            bbox = obj.get("bbox")
+            if bbox is not None and hasattr(bbox, "center"):
+                center = np.asarray(bbox.center)
+                pos[onode] = center
+            else:
+                pos[onode] = np.array([0.0, 0.0, 0.0])
+
+        return pos
+
+    def _region_centroid_xy(self, rn) -> np.ndarray:
+        """Get the 2D centroid of a region mask."""
+        if rn is None or rn.mask is None:
+            return np.array([0.0, 0.0])
+        coords = np.argwhere(rn.mask)
+        if len(coords) == 0:
+            return np.array([0.0, 0.0])
+        centroid = coords.mean(axis=0)
+        return centroid  # (y, x) in grid
+
+    def _render_matplotlib_3d(self, G, node_positions: Dict[str, np.ndarray], output_path: str):
+        """Render the scene graph in 3D using matplotlib."""
+        fig = plt.figure(figsize=(14, 12))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Draw edges as lines
+        for edge in G.edges:
+            if hasattr(G, "edges"):
+                # networkx
+                src, dst = edge
+            else:
+                # dummy graph
+                src, dst, _ = edge
+            if src in node_positions and dst in node_positions:
+                p1 = node_positions[src]
+                p2 = node_positions[dst]
+                ax.plot(
+                    [p1[0], p2[0]],
+                    [p1[1], p2[1]],
+                    [p1[2], p2[2]],
+                    color="gray",
+                    alpha=0.3,
+                    linewidth=1,
+                )
+
+        # Draw nodes as scatter + bbox wireframes
+        for node, pos in node_positions.items():
+            node_data = G.nodes.get(node, {}) if hasattr(G, "nodes") else G.nodes.get(node, {})
+            node_type = node_data.get("type", "unknown")
+            color = node_data.get("color", "black")
+            
+            if node_type == "object":
+                # draw bbox wireframe
+                obj_id = node_data.get("obj_id")
+                obj = None
+                # retrieve object from parent call context (passed via closure or re-fetch)
+                # for simplicity, just draw a sphere marker here
+                ax.scatter(pos[0], pos[1], pos[2], c=color, s=50, alpha=0.7, edgecolors="k")
+                
+                # label
+                class_name = node_data.get("class_name", "?")
+                ax.text(pos[0], pos[1], pos[2], f"{obj_id}:{class_name}", fontsize=6)
+            else:
+                # higher-level nodes
+                marker_size = 200 if node_type == "building" else 100 if node_type == "floor" else 80
+                ax.scatter(pos[0], pos[1], pos[2], c=color, s=marker_size, alpha=0.8, edgecolors="k")
+                ax.text(pos[0], pos[1], pos[2], node.split("_")[-1], fontsize=8, weight="bold")
+
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.set_zlabel("Z (m)")
+        ax.set_title("3D Hierarchical Scene Graph", fontsize=14)
+
+        # set equal aspect (approximate)
+        all_pos = np.array(list(node_positions.values()))
+        if len(all_pos) > 0:
+            max_range = np.ptp(all_pos, axis=0).max()
+            mid = all_pos.mean(axis=0)
+            ax.set_xlim(mid[0] - max_range/2, mid[0] + max_range/2)
+            ax.set_ylim(mid[1] - max_range/2, mid[1] + max_range/2)
+            ax.set_zlim(mid[2] - max_range/2, mid[2] + max_range/2)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close(fig)
+
+    def _render_open3d_scene(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        output_path: str,
+    ):
+        """Render a combined point cloud with bounding boxes (open3d)."""
+        if o3d is None:
+            return
+
+        geometries = []
+
+        # Add object point clouds + bboxes
+        for obj_id, obj in scene_objects.items():
+            pcd = obj.get("pcd")
+            bbox = obj.get("bbox")
+
+            # add point cloud
+            if pcd is not None and hasattr(pcd, "points") and len(pcd.points) > 0:
+                # color by region
+                rid = obj_to_region.get(obj_id, 0)
+                color = plt.cm.tab10(rid % 10)[:3]
+                pcd_copy = o3d.geometry.PointCloud(pcd)
+                pcd_copy.paint_uniform_color(color)
+                geometries.append(pcd_copy)
+
+            # add bbox wireframe
+            if bbox is not None:
+                try:
+                    bbox_lines = o3d.geometry.LineSet.create_from_oriented_bounding_box(bbox)
+                    bbox_lines.paint_uniform_color([1, 0, 0])
+                    geometries.append(bbox_lines)
+                except Exception:
+                    pass
+
+        if not geometries:
+            return
+
+        # save combined scene
+        combined = o3d.geometry.PointCloud()
+        for g in geometries:
+            if isinstance(g, o3d.geometry.PointCloud):
+                combined += g
+
+        try:
+            o3d.io.write_point_cloud(output_path, combined)
+        except Exception:
+            pass
+
+    def generate_graph_visualization_video(
+        self,
+        regions: Dict[int, Any],
+        scene_objects: Dict[int, Dict[str, Any]],
+        obj_to_region: Dict[int, int],
+        floor_id: str,
+        output_video_path: str,
+        n_frames: int = 60,
+        fps: int = 10,
+    ):
+        """Generate a rotating 3D scene graph video (like HOV-SG demo gif).
+
+        Args:
+            n_frames: number of rotation frames
+            fps: frames per second
+        """
+        if not scene_objects:
+            return
+
+        G = self._build_scene_graph(regions, scene_objects, obj_to_region, floor_id)
+        node_positions = self._compute_3d_layout(G, regions, scene_objects, obj_to_region)
+
+        frames = []
+        for frame_idx in range(n_frames):
+            angle = frame_idx * 360 / n_frames
+
+            fig = plt.figure(figsize=(12, 10))
+            ax = fig.add_subplot(111, projection="3d")
+            ax.view_init(elev=20, azim=angle)
+
+            # Draw edges
+            for edge in G.edges:
+                if hasattr(G, "edges"):
+                    src, dst = edge
+                else:
+                    src, dst, _ = edge
+                if src in node_positions and dst in node_positions:
+                    p1 = node_positions[src]
+                    p2 = node_positions[dst]
+                    ax.plot(
+                        [p1[0], p2[0]],
+                        [p1[1], p2[1]],
+                        [p1[2], p2[2]],
+                        color="gray",
+                        alpha=0.3,
+                        linewidth=1,
+                    )
+
+            # Draw nodes
+            for node, pos in node_positions.items():
+                node_data = G.nodes.get(node, {}) if hasattr(G, "nodes") else G.nodes.get(node, {})
+                node_type = node_data.get("type", "unknown")
+                color = node_data.get("color", "black")
+                marker_size = 200 if node_type == "building" else 100 if node_type == "floor" else 80 if node_type == "room" else 50
+                ax.scatter(pos[0], pos[1], pos[2], c=color, s=marker_size, alpha=0.7, edgecolors="k")
+
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.set_zlabel("Z")
+            ax.set_title(f"3D Scene Graph (frame {frame_idx+1}/{n_frames})", fontsize=12)
+
+            all_pos = np.array(list(node_positions.values()))
+            if len(all_pos) > 0:
+                max_range = np.ptp(all_pos, axis=0).max()
+                mid = all_pos.mean(axis=0)
+                ax.set_xlim(mid[0] - max_range/2, mid[0] + max_range/2)
+                ax.set_ylim(mid[1] - max_range/2, mid[1] + max_range/2)
+                ax.set_zlim(mid[2] - max_range/2, mid[2] + max_range/2)
+
+            plt.tight_layout()
+            
+            # render to numpy array
+            fig.canvas.draw()
+            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            frames.append(img)
+            plt.close(fig)
+
+        # save video/gif
+        try:
+            import imageio
+            if output_video_path.endswith(".gif"):
+                imageio.mimsave(output_video_path, frames, fps=fps, loop=0)
+            else:
+                imageio.mimsave(output_video_path, frames, fps=fps, codec="libx264")
+        except Exception as e:
+            # fallback: save frames
+            frame_dir = output_video_path.replace(".mp4", "_frames").replace(".gif", "_frames")
+            os.makedirs(frame_dir, exist_ok=True)
+            for i, frame in enumerate(frames):
+                plt.imsave(os.path.join(frame_dir, f"{i:04d}.png"), frame)
