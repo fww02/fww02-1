@@ -20,9 +20,10 @@ except Exception:  # pragma: no cover
     o3d = None
 
 try:
-    from .visualizer import SceneGraphVisualizer
+    from .visualizer import SceneGraphVisualizer, VisualizationMode
 except Exception:
     SceneGraphVisualizer = None
+    VisualizationMode = None
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -291,6 +292,64 @@ class ExplicitMemoryGraphBuilder:
                 if obj_id not in self._regions[cur_region_id].objects:
                     self._regions[cur_region_id].objects.append(obj_id)
 
+    def _compute_dynamic_map_bounds(
+        self, scene_objects: Dict[int, Dict[str, Any]]
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Compute dynamic map bounds from scene objects and regions.
+        
+        Uses the min/max x, z coordinates from all objects and region masks
+        to determine the map extent. This ensures proper world_to_pixel alignment.
+        
+        Args:
+            scene_objects: Scene objects dictionary
+            
+        Returns:
+            (min_bound, max_bound) where each is (3,) array [x, y, z],
+            or None if no valid bounds can be computed.
+        """
+        all_x = []
+        all_z = []
+        
+        # Collect coordinates from objects
+        for obj_id, obj in scene_objects.items():
+            bbox = obj.get("bbox", None)
+            if bbox is not None and hasattr(bbox, "center"):
+                center = np.asarray(bbox.center)
+                all_x.append(center[0])
+                all_z.append(center[2])
+        
+        # Collect coordinates from region masks
+        for rid, rn in self._regions.items():
+            if rn.mask is not None:
+                # Get mask coordinates and convert to world coordinates
+                coords = np.argwhere(rn.mask)
+                if len(coords) > 0:
+                    # coords are in voxel grid, convert to world
+                    world_coords = coords * self.voxel_size
+                    all_x.extend(world_coords[:, 0].tolist())
+                    all_z.extend(world_coords[:, 1].tolist())
+        
+        # Collect from trajectory
+        if self._trajectory_voxels:
+            for pt in self._trajectory_voxels:
+                all_x.append(pt[0] * self.voxel_size)
+                all_z.append(pt[1] * self.voxel_size)
+        
+        if not all_x or not all_z:
+            return None
+        
+        # Compute bounds with padding
+        padding = 1.0  # 1 meter padding
+        min_x, max_x = min(all_x) - padding, max(all_x) + padding
+        min_z, max_z = min(all_z) - padding, max(all_z) + padding
+        
+        # Create (3,) arrays: [x, y, z] where y is height (we use 0 as default)
+        min_bound = np.array([min_x, 0.0, min_z])
+        max_bound = np.array([max_x, 3.0, max_z])  # Assume 3m ceiling height
+        
+        return (min_bound, max_bound)
+
     def _floor_json(self) -> Dict[str, Any]:
         # keep it minimal but compatible with HOV-SG Floor.save() schema
         return {
@@ -345,8 +404,55 @@ class ExplicitMemoryGraphBuilder:
             "image": obj.get("image", None),
         }
 
-    def save(self, scene_objects: Dict[int, Dict[str, Any]]):
-        """Save graph jsons + point clouds + visualizations to disk (HOV-SG-like directory layout)."""
+    def save(
+        self,
+        scene_objects: Dict[int, Dict[str, Any]],
+        *,
+        # Visualization mode control
+        visualization_mode: Optional[str] = None,  # "textured" | "topology" | None (all)
+        # Textured mode parameters
+        top_down_map: Optional[np.ndarray] = None,
+        agent_position: Optional[np.ndarray] = None,
+        agent_heading: Optional[float] = None,
+        trajectory: Optional[np.ndarray] = None,
+        map_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        # Decision history for conflict visualization
+        decision_history: Optional[Dict[int, list]] = None,
+        # Target object for highlighting
+        target_object_id: Optional[int] = None,
+    ):
+        """Save graph jsons + point clouds + visualizations to disk (HOV-SG-like directory layout).
+        
+        Args:
+            scene_objects: Scene.objects (MapObjectDict-like)
+            visualization_mode: Which visualization mode to use:
+                - "textured": Habitat-rendered top_down_map with agent/object positions
+                - "topology": Semantic topology graph with room->object connections
+                - None: Generate all visualization types
+            top_down_map: Habitat 仿真器实时获取的 RGB 俯视图数组 (H, W, 3) uint8。
+                          该数组会同时用于:
+                          1. textured 模式: 作为 visualize_textured 的底图
+                          2. topology 模式: 作为 visualize_hierarchical_graph 的 bg_image 背景
+            agent_position: Agent 3D position (3,) [x, y, z] for textured mode
+            agent_heading: Agent heading angle (radians) for textured mode
+            trajectory: Agent trajectory (N, 3) for textured mode
+            map_bounds: Map bounds (min_bound, max_bound) for world_to_pixel conversion.
+                        If None, will be computed dynamically from scene objects.
+            decision_history: Decision history from ConflictResolver {obj_id: [decisions]}
+                              Used for conflict node highlighting in topology mode.
+            target_object_id: Target object ID for highlighting in visualization.
+            
+        Example:
+            # 在主循环中调用
+            builder.save(
+                scene.objects,
+                top_down_map=env_metrics['top_down_map'],  # 从 Habitat 获取
+                agent_position=pts,
+                agent_heading=angle,
+                trajectory=trajectory,
+                map_bounds=map_bounds,
+            )
+        """
         graph_root = os.path.join(self.save_root, "explicit_graph", "graph")
         floors_dir = os.path.join(graph_root, "floors")
         rooms_dir = os.path.join(graph_root, "rooms")
@@ -396,210 +502,152 @@ class ExplicitMemoryGraphBuilder:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(_safe_list(meta), f, ensure_ascii=False, indent=2)
 
-        # generate visualizations (region map, object distribution)
-        self._save_visualizations(scene_objects, graph_root)
+        # Compute dynamic map bounds if not provided
+        computed_map_bounds = map_bounds
+        if computed_map_bounds is None:
+            computed_map_bounds = self._compute_dynamic_map_bounds(scene_objects)
 
-        # --- generate 3D hierarchical scene graph visualization (HOV-SG style) ---
-        if SceneGraphVisualizer is not None:
-            try:
-                visualizer = SceneGraphVisualizer(voxel_size=self.voxel_size)
-                
-                # Static 3D scene graph image
-                graph_3d_path = os.path.join(graph_root, "visualizations", "scene_graph_3d.png")
-                visualizer.visualize_hierarchical_graph(
-                    regions=self._regions,
-                    scene_objects=scene_objects,
-                    obj_to_region=self._obj_to_region,
-                    floor_id=self.floor_id,
-                    output_path=graph_3d_path,
-                )
-                
-                # Rotating 3D scene graph video/gif
-                graph_video_path = os.path.join(self.save_root, "explicit_graph", "scene_graph_3d.gif")
-                visualizer.generate_graph_visualization_video(
-                    regions=self._regions,
-                    scene_objects=scene_objects,
-                    obj_to_region=self._obj_to_region,
-                    floor_id=self.floor_id,
-                    output_video_path=graph_video_path,
-                    n_frames=60,
-                    fps=10,
-                )
-            except Exception as e:
-                import logging
-                logging.warning(f"3D scene graph visualization failed: {e}")
+        # generate visualizations (textured topdown and topology graph)
+        self._save_visualizations(
+            scene_objects,
+            graph_root,
+            visualization_mode=visualization_mode,
+            top_down_map=top_down_map,
+            agent_position=agent_position,
+            agent_heading=agent_heading,
+            trajectory=trajectory,
+            map_bounds=computed_map_bounds,
+            decision_history=decision_history,
+            target_object_id=target_object_id,
+        )
 
-        # generate trajectory video if requested
-        if len(self._trajectory_voxels) > 1:
-            video_path = os.path.join(self.save_root, "explicit_graph", "trajectory.mp4")
-            try:
-                self.save_trajectory_video(self._trajectory_voxels, video_path, fps=5)
-            except Exception as e:
-                pass  # skip if video generation fails
-
-    def _save_visualizations(self, scene_objects: Dict[int, Dict[str, Any]], graph_root: str):
-        """Generate visualization images: region map, object counts per region, etc."""
+    def _save_visualizations(
+        self,
+        scene_objects: Dict[int, Dict[str, Any]],
+        graph_root: str,
+        *,
+        visualization_mode: Optional[str] = None,
+        top_down_map: Optional[np.ndarray] = None,
+        agent_position: Optional[np.ndarray] = None,
+        agent_heading: Optional[float] = None,
+        trajectory: Optional[np.ndarray] = None,
+        map_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        decision_history: Optional[Dict[int, list]] = None,
+        target_object_id: Optional[int] = None,
+    ):
+        """Generate visualization images based on the specified mode.
+        
+        Args:
+            scene_objects: Scene objects dictionary
+            graph_root: Root directory for graph output
+            visualization_mode: "textured", "topology", or None (all)
+            top_down_map: Habitat-rendered RGB top-down map (H, W, 3)
+            agent_position: Agent 3D position (3,)
+            agent_heading: Agent heading angle (radians)
+            trajectory: Agent trajectory (N, 3)
+            map_bounds: Map bounds for coordinate transformation
+            decision_history: Decision history from ConflictResolver for conflict highlighting
+            target_object_id: Target object ID for highlighting
+        """
         viz_dir = os.path.join(graph_root, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
 
-        # 1) Draw region masks on a 2D occupancy map
-        self._draw_region_map(viz_dir)
-
-        # 2) Draw object distribution (bboxes + labels on topdown)
-        self._draw_object_distribution(scene_objects, viz_dir)
-
-    def _draw_region_map(self, viz_dir: str):
-        """Draw a topdown view of regions (colored differently)."""
-        if not self._regions:
-            return
-        # find bounding box for all region masks
-        all_masks = [rn.mask for rn in self._regions.values() if rn.mask is not None]
-        if not all_masks:
-            return
-        
-        # stack masks and get max extent
-        h_max = max(m.shape[0] for m in all_masks)
-        w_max = max(m.shape[1] for m in all_masks)
-        
-        # create color image
-        img = np.ones((h_max, w_max, 3), dtype=np.uint8) * 255  # white background
-        
-        cmap = plt.get_cmap("tab10")
-        for idx, (rid, rn) in enumerate(self._regions.items()):
-            if rn.mask is None:
-                continue
-            color_rgb = (np.array(cmap(idx % 10)[:3]) * 255).astype(np.uint8)
-            mask_coords = np.argwhere(rn.mask)
-            for (y, x) in mask_coords:
-                if 0 <= y < h_max and 0 <= x < w_max:
-                    img[y, x] = color_rgb
-
-        fig, ax = plt.subplots(figsize=(10, 10))
-        ax.imshow(img, origin="lower")
-        ax.set_title("Region Map (Topdown)", fontsize=14)
-        ax.axis("off")
-        plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, "region_map.png"), dpi=150)
-        plt.close(fig)
-
-    def _draw_object_distribution(self, scene_objects: Dict[int, Dict[str, Any]], viz_dir: str):
-        """Draw a topdown view showing object bboxes and counts per region."""
-        if not self._regions:
-            return
-        
-        # collect bbox centers in voxel 2D (assume we can project from habitat coords)
-        fig, ax = plt.subplots(figsize=(12, 12))
-        
-        # draw region boundaries
-        all_masks = [rn.mask for rn in self._regions.values() if rn.mask is not None]
-        if all_masks:
-            h_max = max(m.shape[0] for m in all_masks)
-            w_max = max(m.shape[1] for m in all_masks)
-            base_img = np.ones((h_max, w_max), dtype=np.uint8) * 255
+        # Use SceneGraphVisualizer if available
+        if SceneGraphVisualizer is not None and VisualizationMode is not None:
+            visualizer = SceneGraphVisualizer(voxel_size=self.voxel_size, style="academic")
             
-            cmap = plt.get_cmap("Pastel1")
-            for idx, (rid, rn) in enumerate(self._regions.items()):
-                if rn.mask is None:
-                    continue
-                color_val = int(cmap(idx % 9)[0] * 255)
-                mask_coords = np.argwhere(rn.mask)
-                for (y, x) in mask_coords:
-                    if 0 <= y < h_max and 0 <= x < w_max:
-                        base_img[y, x] = color_val
-            ax.imshow(base_img, origin="lower", cmap="gray", alpha=0.3)
-        
-        # draw objects as scatter points (habitat xy -> voxel grid approximation)
-        for obj_id, obj in scene_objects.items():
-            bbox = obj.get("bbox", None)
-            if bbox is None or not hasattr(bbox, "center"):
-                continue
-            center = np.asarray(bbox.center)
-            # convert habitat xyz to 2D voxel grid for visualization (rough heuristic)
-            # NOTE: this is approximate; exact conversion requires planner's vol_bnds
-            x_vox = int(center[0] / self.voxel_size) + 100  # shift for viz
-            z_vox = int(center[2] / self.voxel_size) + 100
+            # Set map bounds if provided
+            if map_bounds is not None:
+                visualizer.set_map_bounds(map_bounds[0], map_bounds[1])
             
-            class_name = obj.get("class_name", "?")
-            ax.scatter(z_vox, x_vox, s=50, c="red", alpha=0.7)
-            ax.text(z_vox, x_vox, f"{obj_id}", fontsize=6, color="black")
-        
-        ax.set_title("Object Distribution (Topdown)", fontsize=14)
-        ax.axis("equal")
-        plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, "object_distribution.png"), dpi=150)
-        plt.close(fig)
-
-    def save_trajectory_video(
-        self,
-        trajectory_points: List[np.ndarray],
-        output_path: str,
-        fps: int = 5,
-    ):
-        """Generate a video showing agent trajectory overlaid on region map (similar to HOV-SG demo).
-
-        Args:
-            trajectory_points: list of (x, z) in voxel grid coords
-            output_path: path to save .mp4 or .gif
-            fps: frames per second
-        """
-        if not self._regions or not trajectory_points:
-            return
-
-        # prepare base image (region map)
-        all_masks = [rn.mask for rn in self._regions.values() if rn.mask is not None]
-        if not all_masks:
-            return
-        h_max = max(m.shape[0] for m in all_masks)
-        w_max = max(m.shape[1] for m in all_masks)
-        base_img = np.ones((h_max, w_max, 3), dtype=np.uint8) * 255
-
-        cmap = plt.get_cmap("tab10")
-        for idx, (rid, rn) in enumerate(self._regions.items()):
-            if rn.mask is None:
-                continue
-            color_rgb = (np.array(cmap(idx % 10)[:3]) * 255).astype(np.uint8)
-            mask_coords = np.argwhere(rn.mask)
-            for (y, x) in mask_coords:
-                if 0 <= y < h_max and 0 <= x < w_max:
-                    base_img[y, x] = color_rgb
-
-        # generate frames
-        frames = []
-        for step_idx, pt in enumerate(trajectory_points):
-            frame = base_img.copy()
-            # draw trajectory up to current step
-            for i in range(step_idx):
-                p0 = trajectory_points[i]
-                p1 = trajectory_points[i + 1] if i + 1 < len(trajectory_points) else p0
-                x0, z0 = int(p0[0]), int(p0[1])
-                x1, z1 = int(p1[0]), int(p1[1])
-                # draw line (simple bresenham-like or use cv2.line if available)
-                # for simplicity, just mark points
-                if 0 <= z0 < h_max and 0 <= x0 < w_max:
-                    frame[z0, x0] = [0, 255, 0]  # green trajectory
-            # mark current position
-            x_cur, z_cur = int(pt[0]), int(pt[1])
-            if 0 <= z_cur < h_max and 0 <= x_cur < w_max:
-                # draw a circle-like marker (5x5 red square)
-                for dy in range(-2, 3):
-                    for dx in range(-2, 3):
-                        yy, xx = z_cur + dy, x_cur + dx
-                        if 0 <= yy < h_max and 0 <= xx < w_max:
-                            frame[yy, xx] = [255, 0, 0]  # red agent
-            frames.append(frame)
-
-        # save as gif or mp4 (requires imageio or opencv)
-        try:
-            import imageio
-            if output_path.endswith(".gif"):
-                imageio.mimsave(output_path, frames, fps=fps)
+            # Collect object positions and classes for textured mode
+            object_positions = {}
+            object_classes = {}
+            for obj_id, obj in scene_objects.items():
+                bbox = obj.get("bbox", None)
+                if bbox is not None and hasattr(bbox, "center"):
+                    object_positions[obj_id] = np.asarray(bbox.center)
+                class_name = obj.get("class_name", None)
+                if class_name:
+                    object_classes[obj_id] = class_name
+            
+            # Build snapshot positions from trajectory (subsample for clarity)
+            snapshot_positions = None
+            snapshot_connections = None
+            object_to_snapshot = None
+            
+            if trajectory is not None and len(trajectory) > 0:
+                # Subsample trajectory to create snapshot positions
+                # Use every N-th point or distance-based sampling
+                step = max(1, len(trajectory) // 20)  # Max ~20 snapshots
+                snapshot_positions = [trajectory[i] for i in range(0, len(trajectory), step)]
+                
+                # Build sequential connections
+                snapshot_connections = [(i, i+1) for i in range(len(snapshot_positions) - 1)]
+                
+                # Associate objects to nearest snapshot
+                if object_positions:
+                    object_to_snapshot = {}
+                    for obj_id, obj_pos in object_positions.items():
+                        min_dist = float('inf')
+                        nearest_snap = 0
+                        for snap_idx, snap_pos in enumerate(snapshot_positions):
+                            dist = np.linalg.norm(obj_pos[[0,2]] - snap_pos[[0,2]])
+                            if dist < min_dist:
+                                min_dist = dist
+                                nearest_snap = snap_idx
+                        object_to_snapshot[obj_id] = nearest_snap
+            
+            # Determine which modes to generate
+            modes_to_generate = []
+            if visualization_mode is None:
+                # Generate textured and topology modes (removed abstract mode)
+                modes_to_generate = ["topology"]
+                if top_down_map is not None:
+                    modes_to_generate.append("textured")
             else:
-                # save as mp4
-                imageio.mimsave(output_path, frames, fps=fps, codec="libx264")
-        except Exception as e:
-            # fallback: save individual frames
-            frame_dir = output_path.replace(".mp4", "_frames").replace(".gif", "_frames")
-            os.makedirs(frame_dir, exist_ok=True)
-            for i, frame in enumerate(frames):
-                plt.imsave(os.path.join(frame_dir, f"{i:04d}.png"), frame)
+                modes_to_generate = [visualization_mode]
+            
+            for mode_str in modes_to_generate:
+                try:
+                    if mode_str == "textured" and top_down_map is not None:
+                        # Textured mode: High-quality academic visualization
+                        output_path = os.path.join(viz_dir, "topdown_textured.png")
+                        visualizer.visualize_textured(
+                            top_down_map=top_down_map,
+                            output_path=output_path,
+                            agent_position=agent_position,
+                            agent_heading=agent_heading,
+                            object_positions=object_positions if object_positions else None,
+                            object_classes=object_classes if object_classes else None,
+                            trajectory=trajectory,
+                            snapshot_positions=snapshot_positions,
+                            snapshot_connections=snapshot_connections,
+                            object_to_snapshot=object_to_snapshot,
+                            target_object_id=target_object_id,  # Pass target object for highlighting
+                            title=f"Scene Graph - Floor {self.floor_id}",
+                            show_object_labels=True,  # Show class labels
+                            show_legend=True,         # Show legend
+                            figsize=(20, 16),         # High-resolution output
+                            dpi=300,                  # Publication quality
+                        )
+                    
+                    elif mode_str == "topology":
+                        # Topology mode: Hierarchical graph with room->object connections
+                        output_path = os.path.join(viz_dir, "scene_graph_topology.png")
+                        visualizer.visualize_hierarchical_graph(
+                            regions=self._regions,
+                            scene_objects=scene_objects,
+                            obj_to_region=self._obj_to_region,
+                            floor_id=self.floor_id,
+                            output_path=output_path,
+                            decision_history=decision_history,
+                            bg_image=top_down_map,  # Pass top_down_map as background image
+                        )
+                
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Visualization mode '{mode_str}' failed: {e}")
+        
+
 
