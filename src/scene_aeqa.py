@@ -940,3 +940,312 @@ class Scene:
             logging.info(f"{snapshot_id}:")
             for obj_str in obj_list:
                 logging.info(f"\t{obj_str}")
+
+    def get_topdown_map(self, colorize: bool = True, meters_per_pixel: float = 0.025):
+        """
+        Return a top-down map for the current scene with real texture rendering.
+        
+        Uses Habitat's orthographic camera to render a true top-down textured view,
+        showing actual furniture (sofas, beds, tables, etc.) from above.
+
+        Args:
+            colorize: If True, return RGB colorized map; if False, return binary occupancy
+            meters_per_pixel: Resolution of the topdown map (default 0.025m = 2.5cm per pixel)
+
+        Returns:
+            (rgb_map, map_bounds)
+            - rgb_map: HxWx3 uint8 RGB array with real scene textures
+            - map_bounds: (min_bound, max_bound) as two (3,) numpy arrays, or None
+        """
+        import cv2
+        
+        # Try to get bounds from pathfinder
+        map_bounds = None
+        try:
+            if hasattr(self, "pathfinder") and self.pathfinder is not None:
+                bounds = self.pathfinder.get_bounds()
+                if bounds is not None:
+                    map_bounds = (np.array(bounds[0]), np.array(bounds[1]))
+        except Exception:
+            map_bounds = None
+
+        if map_bounds is None:
+            return None, None
+
+        min_bound, max_bound = map_bounds
+        
+        # Compute map dimensions
+        x_range = max_bound[0] - min_bound[0]
+        z_range = max_bound[2] - min_bound[2]
+        
+        map_width = int(np.ceil(x_range / meters_per_pixel))
+        map_height = int(np.ceil(z_range / meters_per_pixel))
+        
+        # Clamp to reasonable size
+        max_dim = 2000
+        if map_width > max_dim or map_height > max_dim:
+            scale = max_dim / max(map_width, map_height)
+            map_width = int(map_width * scale)
+            map_height = int(map_height * scale)
+            meters_per_pixel = max(x_range, z_range) / max_dim
+
+        # ========== Method 1: Try to render using orthographic top-down camera ==========
+        try:
+            rgb_textured = self._render_topdown_textured(
+                min_bound, max_bound, map_width, map_height, meters_per_pixel
+            )
+            if rgb_textured is not None:
+                return rgb_textured, map_bounds
+        except Exception as e:
+            logging.debug(f"Textured topdown rendering failed: {e}")
+
+        # ========== Method 2: Fallback to navmesh-based occupancy map ==========
+        topdown = np.zeros((map_height, map_width), dtype=np.uint8)
+        
+        try:
+            # Get navmesh vertices and create navigable area
+            if hasattr(self, "pathfinder") and self.pathfinder is not None:
+                navmesh_vertices = self.pathfinder.build_navmesh_vertices()
+                navmesh_indices = self.pathfinder.build_navmesh_vertex_indices()
+                
+                if navmesh_vertices and navmesh_indices:
+                    # Convert vertices to numpy array
+                    vertices = np.array([np.array(v).flatten() for v in navmesh_vertices])
+                    
+                    # Draw triangles on topdown map
+                    for i in range(0, len(navmesh_indices), 3):
+                        if i + 2 < len(navmesh_indices):
+                            idx0, idx1, idx2 = navmesh_indices[i], navmesh_indices[i+1], navmesh_indices[i+2]
+                            if idx0 < len(vertices) and idx1 < len(vertices) and idx2 < len(vertices):
+                                v0, v1, v2 = vertices[idx0], vertices[idx1], vertices[idx2]
+                                
+                                # Project to 2D (XZ plane)
+                                pts = np.array([
+                                    [(v0[0] - min_bound[0]) / meters_per_pixel, (v0[2] - min_bound[2]) / meters_per_pixel],
+                                    [(v1[0] - min_bound[0]) / meters_per_pixel, (v1[2] - min_bound[2]) / meters_per_pixel],
+                                    [(v2[0] - min_bound[0]) / meters_per_pixel, (v2[2] - min_bound[2]) / meters_per_pixel],
+                                ], dtype=np.int32)
+                                
+                                # Clamp to map bounds
+                                pts[:, 0] = np.clip(pts[:, 0], 0, map_width - 1)
+                                pts[:, 1] = np.clip(pts[:, 1], 0, map_height - 1)
+                                
+                                # Fill triangle
+                                cv2.fillPoly(topdown, [pts], 255)
+        except Exception as e:
+            logging.debug(f"Failed to build navmesh topdown: {e}")
+            # If navmesh approach fails, try sampling-based approach
+            try:
+                if hasattr(self, "pathfinder") and self.pathfinder is not None:
+                    # Sample points and mark navigable areas
+                    for _ in range(10000):
+                        pt = self.pathfinder.get_random_navigable_point()
+                        if pt is not None:
+                            px = int((pt[0] - min_bound[0]) / meters_per_pixel)
+                            pz = int((pt[2] - min_bound[2]) / meters_per_pixel)
+                            if 0 <= px < map_width and 0 <= pz < map_height:
+                                # Mark a small area around the point
+                                for dx in range(-2, 3):
+                                    for dz in range(-2, 3):
+                                        npx, npz = px + dx, pz + dz
+                                        if 0 <= npx < map_width and 0 <= npz < map_height:
+                                            topdown[npz, npx] = 255
+            except Exception:
+                pass
+
+        # Colorize
+        if colorize:
+            # Create RGB: navigable=light gray, obstacle=dark
+            rgb = np.zeros((map_height, map_width, 3), dtype=np.uint8)
+            rgb[topdown > 0] = [200, 200, 200]  # navigable: light gray
+            rgb[topdown == 0] = [50, 50, 50]     # obstacle: dark gray
+        else:
+            rgb = topdown
+
+        return rgb, map_bounds
+
+    def _render_topdown_textured(
+        self,
+        min_bound: np.ndarray,
+        max_bound: np.ndarray,
+        map_width: int,
+        map_height: int,
+        meters_per_pixel: float,
+    ) -> Optional[np.ndarray]:
+        """
+        Render a top-down textured view by rendering from multiple low-altitude viewpoints.
+        
+        Instead of looking straight down (which only shows floor), this method 
+        renders from multiple angled viewpoints at furniture height to capture
+        the actual appearance of objects.
+        
+        Args:
+            min_bound: Scene minimum bounds (3,)
+            max_bound: Scene maximum bounds (3,)
+            map_width: Output map width in pixels
+            map_height: Output map height in pixels
+            meters_per_pixel: Resolution
+            
+        Returns:
+            RGB image (H, W, 3) uint8 or None if failed
+        """
+        import habitat_sim
+        import cv2
+        from scipy.spatial.transform import Rotation as R
+        
+        try:
+            # Get the agent
+            agent = self.simulator.get_agent(0)
+            agent_state = agent.get_state()
+            
+            # Scene dimensions
+            x_range = max_bound[0] - min_bound[0]
+            z_range = max_bound[2] - min_bound[2]
+            y_floor = min_bound[1]
+            
+            # Create output canvas
+            output = np.ones((map_height, map_width, 3), dtype=np.uint8) * 240  # Light gray background
+            
+            # Rotation for looking straight down
+            rot_down = R.from_euler('x', -90, degrees=True)
+            cam_rotation_down = rot_down.as_quat()
+            cam_rotation_habitat = np.quaternion(
+                cam_rotation_down[3], cam_rotation_down[0], cam_rotation_down[1], cam_rotation_down[2]
+            )
+            
+            # Get camera FOV
+            sensor_hfov = self.cfg.hfov if hasattr(self.cfg, 'hfov') else 90
+            fov_rad = np.radians(sensor_hfov)
+            
+            # Render from low height to see furniture tops (not just floor)
+            # Camera at ~2m height looking down covers furniture
+            cam_height = y_floor + 2.5  # 2.5m above floor - sees furniture tops
+            
+            # Calculate ground coverage at this height
+            effective_height = cam_height - y_floor
+            ground_coverage = 2 * effective_height * np.tan(fov_rad / 2)
+            
+            # Tile step with overlap
+            step = ground_coverage * 0.4  # 60% overlap for smooth blending
+            
+            n_tiles_x = max(1, int(np.ceil(x_range / step)) + 2)
+            n_tiles_z = max(1, int(np.ceil(z_range / step)) + 2)
+            
+            # Weight map for blending
+            weight_map = np.zeros((map_height, map_width), dtype=np.float32)
+            color_accum = np.zeros((map_height, map_width, 3), dtype=np.float32)
+            
+            for ti in range(n_tiles_z):
+                for tj in range(n_tiles_x):
+                    tile_center_x = min_bound[0] - step + tj * step
+                    tile_center_z = min_bound[2] - step + ti * step
+                    
+                    # Camera position
+                    cam_position = np.array([tile_center_x, cam_height, tile_center_z])
+                    
+                    # Set agent state
+                    new_state = habitat_sim.AgentState()
+                    new_state.position = cam_position
+                    new_state.rotation = cam_rotation_habitat
+                    agent.set_state(new_state)
+                    
+                    # Render
+                    obs = self.simulator.get_sensor_observations()
+                    if "color_sensor" not in obs:
+                        continue
+                    
+                    rgb_tile = obs["color_sensor"]
+                    if rgb_tile.shape[-1] == 4:
+                        rgb_tile = rgb_tile[:, :, :3]
+                    
+                    h, w = rgb_tile.shape[:2]
+                    
+                    # Map each rendered pixel to output coordinates
+                    half_cov = ground_coverage / 2
+                    
+                    # Crop center to reduce distortion
+                    margin = 0.15
+                    y1, y2 = int(h * margin), int(h * (1 - margin))
+                    x1, x2 = int(w * margin), int(w * (1 - margin))
+                    cropped = rgb_tile[y1:y2, x1:x2]
+                    ch, cw = cropped.shape[:2]
+                    
+                    # Coverage after crop
+                    crop_cov = ground_coverage * (1 - 2 * margin)
+                    half_crop = crop_cov / 2
+                    
+                    # Output coordinates
+                    px_x1 = int((tile_center_x - half_crop - min_bound[0]) / meters_per_pixel)
+                    px_z1 = int((tile_center_z - half_crop - min_bound[2]) / meters_per_pixel)
+                    px_x2 = int((tile_center_x + half_crop - min_bound[0]) / meters_per_pixel)
+                    px_z2 = int((tile_center_z + half_crop - min_bound[2]) / meters_per_pixel)
+                    
+                    # Clamp
+                    out_x1 = max(0, px_x1)
+                    out_z1 = max(0, px_z1)
+                    out_x2 = min(map_width, px_x2)
+                    out_z2 = min(map_height, px_z2)
+                    
+                    if out_x2 <= out_x1 or out_z2 <= out_z1:
+                        continue
+                    
+                    # Resize cropped tile to output region size
+                    out_w = out_x2 - out_x1
+                    out_h = out_z2 - out_z1
+                    
+                    # Calculate corresponding source region
+                    if px_x2 != px_x1 and px_z2 != px_z1:
+                        src_x1 = int((out_x1 - px_x1) / (px_x2 - px_x1) * cw)
+                        src_z1 = int((out_z1 - px_z1) / (px_z2 - px_z1) * ch)
+                        src_x2 = int((out_x2 - px_x1) / (px_x2 - px_x1) * cw)
+                        src_z2 = int((out_z2 - px_z1) / (px_z2 - px_z1) * ch)
+                    else:
+                        continue
+                    
+                    src_x1, src_x2 = max(0, src_x1), min(cw, src_x2)
+                    src_z1, src_z2 = max(0, src_z1), min(ch, src_z2)
+                    
+                    if src_x2 <= src_x1 or src_z2 <= src_z1:
+                        continue
+                    
+                    src_region = cropped[src_z1:src_z2, src_x1:src_x2]
+                    if src_region.shape[0] < 2 or src_region.shape[1] < 2:
+                        continue
+                    
+                    resized = cv2.resize(src_region, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                    
+                    # Create center-weighted mask for blending
+                    y_coords = np.linspace(-1, 1, out_h)
+                    x_coords = np.linspace(-1, 1, out_w)
+                    xx, yy = np.meshgrid(x_coords, y_coords)
+                    # Gaussian-like center weight
+                    blend_mask = np.exp(-(xx**2 + yy**2) / 0.5)
+                    
+                    # Accumulate
+                    color_accum[out_z1:out_z2, out_x1:out_x2] += resized.astype(np.float32) * blend_mask[:, :, np.newaxis]
+                    weight_map[out_z1:out_z2, out_x1:out_x2] += blend_mask
+            
+            # Normalize by weights
+            valid = weight_map > 0
+            for c in range(3):
+                output[:, :, c] = np.where(
+                    valid,
+                    (color_accum[:, :, c] / weight_map).astype(np.uint8),
+                    output[:, :, c]
+                )
+            
+            # Restore agent state
+            agent.set_state(agent_state)
+            
+            # Check if we rendered anything
+            if not valid.any():
+                logging.warning("Top-down rendering produced empty image")
+                return None
+            
+            return output
+            
+        except Exception as e:
+            logging.warning(f"Top-down textured rendering failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
